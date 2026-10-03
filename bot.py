@@ -95,7 +95,6 @@ class GiphyClient:
         if not query:
             query = "funny reaction"
 
-        # Слишком длинные запросы GIPHY не нужны
         query = query[:100]
 
         url = "https://api.giphy.com/v1/gifs/search"
@@ -282,6 +281,14 @@ class RoastService:
         except TelegramError:
             pass
 
+        # Сначала добавляем сообщение пользователя в историю
+        self.histories[job.chat_id].append(
+            Entry(
+                author=job.author,
+                text=job.text,
+            )
+        )
+
         history = [
             f"{entry.author}: {entry.text}"
             for entry in self.histories[job.chat_id]
@@ -302,13 +309,6 @@ class RoastService:
 
         roast = roast[: self.settings.max_reply_chars]
 
-        self.histories[job.chat_id].append(
-            Entry(
-                author=job.author,
-                text=job.text,
-            )
-        )
-
         delay = random.uniform(
             self.settings.min_delay_seconds,
             self.settings.max_delay_seconds,
@@ -318,6 +318,7 @@ class RoastService:
 
         await self._send(job, roast)
 
+        # Затем добавляем ответ бота в историю
         self.histories[job.chat_id].append(
             Entry(
                 author="Бот (ты)",
@@ -399,11 +400,9 @@ class RoastService:
             logger.warning("Не удалось отправить сохранённое медиа %s: %s", kind, exc)
             return False
 
-
     async def _send(self, job: Job, roast: str) -> None:
         bot = self.application.bot
 
-        # Владельцу отвечаем только текстом: медиа и голосовые не проходят через ИИ
         if job.is_owner:
             try:
                 await bot.send_message(
@@ -415,19 +414,15 @@ class RoastService:
                 logger.exception("Не удалось отправить ответ владельцу")
             return
 
-        # 25% — медиа, которое раньше отправили участники группы
         if random.random() < 0.25:
             if await self._send_saved_media(job, roast):
                 return
 
-        # Примерно 30% ответов — GIF, если GIPHY настроен
         use_giphy = self.giphy.enabled and random.random() < 0.30
 
         if use_giphy:
             gif_url = None
 
-            # Иногда берём трендовый GIF,
-            # иногда ищем по смыслу сообщения
             if random.random() < 0.25:
                 gif_url = await self.giphy.trending_gif()
             else:
@@ -449,7 +444,6 @@ class RoastService:
                         exc,
                     )
 
-        # Локальные медиа
         choice = random.random()
 
         photos = _media_files(
@@ -473,7 +467,6 @@ class RoastService:
         )
 
         try:
-            # 15% фото
             if photos and choice < 0.15:
                 photo = random.choice(photos)
 
@@ -487,7 +480,6 @@ class RoastService:
 
                 return
 
-            # 15% локальный GIF
             if gifs and choice < 0.30:
                 gif = random.choice(gifs)
 
@@ -501,7 +493,6 @@ class RoastService:
 
                 return
 
-            # 10% стикер
             if stickers and choice < 0.40:
                 sticker = random.choice(stickers)
 
@@ -519,7 +510,6 @@ class RoastService:
 
                 return
 
-            # 10% голосовое
             if voices and choice < 0.50:
                 voice = random.choice(voices)
 
@@ -533,7 +523,6 @@ class RoastService:
 
                 return
 
-            # Обычный текст
             await bot.send_message(
                 chat_id=job.chat_id,
                 text=roast,
@@ -749,20 +738,6 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif message.voice:
         service.media_memory.add("voices", message.voice.file_id)
-        try:
-            f = await context.bot.get_file(message.voice.file_id)
-            path = f"voice_{message.from_user.id}.ogg"
-            await f.download_to_drive(path)
-            
-            from openai import OpenAI
-            client = OpenAI()
-            with open(path, "rb") as audio:
-                message.text = client.audio.transcriptions.create(model="whisper-1", file=audio).text
-            
-            import os; os.remove(path)
-            if message.text: await on_text(update, context)
-        except Exception as e:
-            print(f"Ошибка голоса: {e}")    
 
 
 async def on_text(
@@ -823,7 +798,6 @@ async def _health_handler(reader, writer) -> None:
 
 
 async def start_health_server():
-    """На Render слушаем порт PORT, чтобы бесплатный Web Service считался живым."""
     port = os.getenv("PORT", "").strip()
 
     if not port:
@@ -859,7 +833,7 @@ async def post_init(
     application.bot_data["roast_service"] = service
 
     logger.info(
-        "Бот запущен. Gemini model: %s",
+        "Бот запущен. AI model: %s",
         settings.ai_model,
     )
 
@@ -902,7 +876,6 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    # httpx пишет в лог адреса запросов вместе с токеном и ключом
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -916,7 +889,6 @@ def main() -> None:
 
     application.bot_data["settings"] = settings
 
-    # Команды
     application.add_handler(
         CommandHandler("start", cmd_start)
     )
@@ -941,7 +913,6 @@ def main() -> None:
         CommandHandler("myid", cmd_myid)
     )
 
-    # Обычные сообщения группы
     application.add_handler(
         MessageHandler(
             (filters.TEXT | filters.CAPTION)
@@ -982,4 +953,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
