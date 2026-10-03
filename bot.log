@@ -24,3 +24,56 @@
 2026-10-03 16:56:42,821 | INFO | __main__ | \u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u043e\u0435 \u043c\u0435\u0434\u0438\u0430: gifs
 2026-10-03 17:13:23,802 | INFO | __main__ | \u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u043e\u0435 \u043c\u0435\u0434\u0438\u0430: voices
 2026-10-03 17:14:50,905 | INFO | __main__ | \u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u043e\u0435 \u043c\u0435\u0434\u0438\u0430: stickers
+2026-10-03 18:07:24,599 | ERROR | telegram.ext | Network Retry Loop (Polling Updates): Invalid token. Aborting retry loop.
+Traceback (most recent call last):
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\ext\_utils\networkloop.py", line 115, in network_retry_loop
+    if not await do_action():
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\ext\_utils\networkloop.py", line 108, in do_action
+    return action_cb_task.result()
+           ~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\ext\_updater.py", line 376, in polling_action_cb
+    updates = await self.bot.get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\ext\_extbot.py", line 658, in get_updates
+    updates = await super().get_updates(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<9 lines>...
+    )
+    ^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\_bot.py", line 4605, in get_updates
+    await self._post(
+    ^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    ),
+    ^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\_bot.py", line 691, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+    )
+    ^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\ext\_extbot.py", line 362, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+    )
+    ^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\_bot.py", line 720, in _do_post
+    result = await request.post(
+             ^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+    )
+    ^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\request\_baserequest.py", line 202, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "C:\Users\hp\OneDrive\Desktop\telegram_roast_bot\venv\Lib\site-packages\telegram\request\_baserequest.py", line 381, in _request_wrapper
+    raise InvalidToken(message)
+telegram.error.InvalidToken: Unauthorized

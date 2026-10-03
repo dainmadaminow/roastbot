@@ -23,6 +23,18 @@ from config import ConfigError, Settings, load_settings
 from state import ChatStateStore
 from media_memory import MediaMemory
 
+async def self_ping():
+    import asyncio, os, httpx
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(600)
+            try:
+                await client.get(url)
+            except Exception:
+                pass
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -949,6 +961,8 @@ def main() -> None:
 
     logger.info("Запускаю polling...")
 
+    asyncio.create_task(self_ping())
+
     application.run_polling(
         drop_pending_updates=True
     )
@@ -956,3 +970,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
