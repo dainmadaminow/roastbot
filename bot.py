@@ -749,6 +749,20 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif message.voice:
         service.media_memory.add("voices", message.voice.file_id)
+        try:
+            f = await context.bot.get_file(message.voice.file_id)
+            path = f"voice_{message.from_user.id}.ogg"
+            await f.download_to_drive(path)
+            
+            from openai import OpenAI
+            client = OpenAI()
+            with open(path, "rb") as audio:
+                message.text = client.audio.transcriptions.create(model="whisper-1", file=audio).text
+            
+            import os; os.remove(path)
+            if message.text: await on_text(update, context)
+        except Exception as e:
+            print(f"Ошибка голоса: {e}")    
 
 
 async def on_text(
