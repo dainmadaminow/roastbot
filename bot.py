@@ -961,8 +961,6 @@ def main() -> None:
 
     logger.info("Запускаю polling...")
 
-    asyncio.create_task(self_ping())
-
     application.run_polling(
         drop_pending_updates=True
     )
