@@ -1,4 +1,4 @@
-"""Работа с Gemini API напрямую через HTTP."""
+"""Работа с Groq API через OpenAI-совместимый интерфейс."""
 from __future__ import annotations
 
 import logging
@@ -40,7 +40,7 @@ class PersonalityLoader:
 
 
 def build_user_prompt(history_lines: list[str], author: str, text: str) -> str:
-    """Создаёт запрос для Gemini."""
+    """Создаёт запрос для ИИ."""
     transcript = "\n".join(history_lines) if history_lines else "(пока пусто)"
 
     return (
@@ -54,7 +54,7 @@ def build_user_prompt(history_lines: list[str], author: str, text: str) -> str:
 
 
 def clean_reply(raw: str | None, max_chars: int) -> str | None:
-    """Очищает ответ Gemini."""
+    """Очищает ответ от лишних символов."""
     if not raw:
         return None
 
@@ -105,7 +105,7 @@ class AIClient:
         text: str,
         is_owner: bool = False,
     ) -> str | None:
-        """Возвращает ответ или None, если Gemini недоступен."""
+        """Возвращает ответ или None при ошибке."""
 
         loader = self._owner_personality if is_owner else self._personality
         system_prompt = loader.get()
@@ -136,71 +136,44 @@ class AIClient:
         system_prompt: str,
         user_prompt: str,
     ) -> str:
-        """Отправляет запрос напрямую в Gemini API."""
+        """Отправляет запрос в Groq API."""
+        base_url = self._settings.ai_base_url.rstrip("/")
+        url = f"{base_url}/chat/completions"
 
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self._settings.ai_model}:generateContent"
-        )
-
-        params = {
-            "key": self._settings.ai_api_key,
+        headers = {
+            "Authorization": f"Bearer {self._settings.ai_api_key}",
+            "Content-Type": "application/json",
         }
 
         payload = {
-            "systemInstruction": {
-                "parts": [
-                    {
-                        "text": system_prompt,
-                    }
-                ]
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "text": user_prompt,
-                        }
-                    ],
-                }
+            "model": self._settings.ai_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
-            "generationConfig": {
-                "temperature": self._settings.ai_temperature,
-                "maxOutputTokens": self._settings.ai_max_tokens,
-            },
+            "temperature": self._settings.ai_temperature,
+            "max_tokens": self._settings.ai_max_tokens,
         }
 
         response = await self._client.post(
             url,
-            params=params,
+            headers=headers,
             json=payload,
         )
 
         if response.status_code != 200:
             logger.error(
-                "Gemini API HTTP %s: %s",
+                "Groq API HTTP %s: %s",
                 response.status_code,
                 response.text[:1000],
             )
             response.raise_for_status()
 
         data = response.json()
+        choices = data.get("choices", [])
 
-        candidates = data.get("candidates", [])
-
-        if not candidates:
-            logger.warning("Gemini не вернул candidates: %s", data)
+        if not choices:
+            logger.warning("Groq не вернул choices: %s", data)
             return ""
 
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-        )
-
-        return "".join(
-            part.get("text", "")
-            for part in parts
-            if isinstance(part, dict)
-        )
+        return choices[0].get("message", {}).get("content", "")
