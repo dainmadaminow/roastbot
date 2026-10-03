@@ -1,0 +1,958 @@
+import asyncio
+import logging
+import os
+import random
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
+
+import httpx
+from telegram import Update
+from telegram.constants import ChatAction, ChatType
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from ai import AIClient
+from config import ConfigError, Settings, load_settings
+from state import ChatStateStore
+from media_memory import MediaMemory
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+MEDIA_DIR = BASE_DIR / "media"
+PHOTO_DIR = MEDIA_DIR / "photos"
+GIF_DIR = MEDIA_DIR / "gifs"
+STICKER_DIR = MEDIA_DIR / "stickers"
+VOICE_DIR = MEDIA_DIR / "voices"
+
+logger = logging.getLogger(__name__)
+
+
+GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
+
+
+@dataclass
+class Entry:
+    author: str
+    text: str
+
+
+@dataclass
+class Job:
+    chat_id: int
+    message_id: int
+    author: str
+    text: str
+    user_id: int
+    is_owner: bool = False
+
+
+def _media_files(folder: Path, extensions: tuple[str, ...]) -> list[Path]:
+    if not folder.exists():
+        return []
+
+    return [
+        path
+        for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in extensions
+    ]
+
+
+class GiphyClient:
+    def __init__(self) -> None:
+        self.api_key = os.getenv("GIPHY_API_KEY", "").strip()
+        self.client = httpx.AsyncClient(timeout=10)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    async def search_gif(self, query: str) -> str | None:
+        if not self.enabled:
+            return None
+
+        query = query.strip()
+
+        if not query:
+            query = "funny reaction"
+
+        # Слишком длинные запросы GIPHY не нужны
+        query = query[:100]
+
+        url = "https://api.giphy.com/v1/gifs/search"
+
+        params = {
+            "api_key": self.api_key,
+            "q": query,
+            "limit": 10,
+            "rating": "pg-13",
+            "lang": "en",
+        }
+
+        try:
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            results = data.get("data", [])
+
+            if not results:
+                return None
+
+            gif = random.choice(results)
+
+            images = gif.get("images", {})
+            original = images.get("original", {})
+            gif_url = original.get("url")
+
+            if gif_url:
+                return gif_url
+
+        except Exception as exc:
+            logger.warning("Ошибка GIPHY: %s", exc)
+
+        return None
+
+    async def trending_gif(self) -> str | None:
+        if not self.enabled:
+            return None
+
+        url = "https://api.giphy.com/v1/gifs/trending"
+
+        params = {
+            "api_key": self.api_key,
+            "limit": 20,
+            "rating": "pg-13",
+        }
+
+        try:
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+            results = data.get("data", [])
+
+            if not results:
+                return None
+
+            gif = random.choice(results)
+
+            images = gif.get("images", {})
+            original = images.get("original", {})
+            gif_url = original.get("url")
+
+            if gif_url:
+                return gif_url
+
+        except Exception as exc:
+            logger.warning("Ошибка GIPHY Trending: %s", exc)
+
+        return None
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+
+class RoastService:
+    def __init__(
+        self,
+        application: Application,
+        settings: Settings,
+        ai: AIClient,
+        state: ChatStateStore,
+        giphy: GiphyClient,
+    ) -> None:
+        self.application = application
+        self.settings = settings
+        self.ai = ai
+        self.state = state
+        self.giphy = giphy
+        self.media_memory = MediaMemory()
+
+        self.queues: dict[int, deque[Job]] = defaultdict(deque)
+        self.workers: dict[int, asyncio.Task] = {}
+        self.histories: dict[int, deque[Entry]] = defaultdict(
+            lambda: deque(maxlen=settings.max_context_messages)
+        )
+
+        self.ai_semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+
+        try:
+            self.owner_id = int(os.getenv("ROAST_OWNER_ID", "0") or "0")
+        except ValueError:
+            self.owner_id = 0
+
+        if self.owner_id:
+            logger.info("Владелец задан. ID: %s", self.owner_id)
+        else:
+            logger.warning("ROAST_OWNER_ID не установлен!")
+
+    def is_owner(self, user_id: int | None) -> bool:
+        return bool(
+            self.owner_id
+            and user_id is not None
+            and user_id == self.owner_id
+        )
+
+    def enqueue(
+        self,
+        chat_id: int,
+        message_id: int,
+        author: str,
+        text: str,
+        user_id: int | None = None,
+    ) -> None:
+        if not self.state.is_enabled(chat_id):
+            return
+
+        text = text.strip()
+
+        if not text:
+            return
+
+        if len(text) > self.settings.max_message_chars:
+            text = text[: self.settings.max_message_chars]
+
+        job = Job(
+            chat_id=chat_id,
+            message_id=message_id,
+            author=author,
+            text=text,
+            user_id=user_id or 0,
+            is_owner=self.is_owner(user_id),
+        )
+
+        queue = self.queues[chat_id]
+
+        if len(queue) >= self.settings.chat_queue_size:
+            queue.popleft()
+
+        queue.append(job)
+
+        if chat_id not in self.workers or self.workers[chat_id].done():
+            self.workers[chat_id] = asyncio.create_task(
+                self._worker(chat_id)
+            )
+
+    async def _worker(self, chat_id: int) -> None:
+        while True:
+            queue = self.queues[chat_id]
+
+            if not queue:
+                break
+
+            job = queue.popleft()
+
+            try:
+                await self._process(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Ошибка обработки сообщения %s в чате %s",
+                    job.message_id,
+                    chat_id,
+                )
+
+    async def _process(self, job: Job) -> None:
+        try:
+            await self.application.bot.send_chat_action(
+                chat_id=job.chat_id,
+                action=ChatAction.TYPING,
+            )
+        except TelegramError:
+            pass
+
+        history = [
+            f"{entry.author}: {entry.text}"
+            for entry in self.histories[job.chat_id]
+        ]
+
+        async with self.ai_semaphore:
+            roast = await self.ai.generate_roast(
+                history_lines=history,
+                author=job.author,
+                text=job.text,
+                is_owner=job.is_owner,
+            )
+
+        roast = (roast or "").strip()
+
+        if not roast:
+            roast = "У меня даже слов на это нет 💀"
+
+        roast = roast[: self.settings.max_reply_chars]
+
+        self.histories[job.chat_id].append(
+            Entry(
+                author=job.author,
+                text=job.text,
+            )
+        )
+
+        delay = random.uniform(
+            self.settings.min_delay_seconds,
+            self.settings.max_delay_seconds,
+        )
+
+        await asyncio.sleep(delay)
+
+        await self._send(job, roast)
+
+        self.histories[job.chat_id].append(
+            Entry(
+                author="Бот (ты)",
+                text=roast,
+            )
+        )
+
+    async def _send_saved_media(self, job: Job, roast: str) -> bool:
+        bot = self.application.bot
+        memory = self.media_memory
+
+        kinds = []
+
+        if memory.count("photos"):
+            kinds.append("photos")
+
+        if memory.count("gifs"):
+            kinds.append("gifs")
+
+        if memory.count("stickers"):
+            kinds.append("stickers")
+
+        if memory.count("voices"):
+            kinds.append("voices")
+
+        if not kinds:
+            return False
+
+        kind = random.choice(kinds)
+        file_id = memory.random(kind)
+
+        if not file_id:
+            return False
+
+        try:
+            if kind == "photos":
+                await bot.send_photo(
+                    chat_id=job.chat_id,
+                    photo=file_id,
+                    caption=roast,
+                    reply_to_message_id=job.message_id,
+                )
+
+            elif kind == "gifs":
+                await bot.send_animation(
+                    chat_id=job.chat_id,
+                    animation=file_id,
+                    caption=roast,
+                    reply_to_message_id=job.message_id,
+                )
+
+            elif kind == "stickers":
+                await bot.send_sticker(
+                    chat_id=job.chat_id,
+                    sticker=file_id,
+                )
+                await bot.send_message(
+                    chat_id=job.chat_id,
+                    text=roast,
+                    reply_to_message_id=job.message_id,
+                )
+
+            elif kind == "voices":
+                await bot.send_voice(
+                    chat_id=job.chat_id,
+                    voice=file_id,
+                    reply_to_message_id=job.message_id,
+                )
+                await bot.send_message(
+                    chat_id=job.chat_id,
+                    text=roast,
+                    reply_to_message_id=job.message_id,
+                )
+
+            logger.info("Отправлено сохранённое медиа: %s", kind)
+            return True
+
+        except (BadRequest, TimedOut, NetworkError, TelegramError) as exc:
+            logger.warning("Не удалось отправить сохранённое медиа %s: %s", kind, exc)
+            return False
+
+
+    async def _send(self, job: Job, roast: str) -> None:
+        bot = self.application.bot
+
+        # Владельцу отвечаем только текстом: медиа и голосовые не проходят через ИИ
+        if job.is_owner:
+            try:
+                await bot.send_message(
+                    chat_id=job.chat_id,
+                    text=roast,
+                    reply_to_message_id=job.message_id,
+                )
+            except TelegramError:
+                logger.exception("Не удалось отправить ответ владельцу")
+            return
+
+        # 25% — медиа, которое раньше отправили участники группы
+        if random.random() < 0.25:
+            if await self._send_saved_media(job, roast):
+                return
+
+        # Примерно 30% ответов — GIF, если GIPHY настроен
+        use_giphy = self.giphy.enabled and random.random() < 0.30
+
+        if use_giphy:
+            gif_url = None
+
+            # Иногда берём трендовый GIF,
+            # иногда ищем по смыслу сообщения
+            if random.random() < 0.25:
+                gif_url = await self.giphy.trending_gif()
+            else:
+                search_query = job.text[:80]
+                gif_url = await self.giphy.search_gif(search_query)
+
+            if gif_url:
+                try:
+                    await bot.send_animation(
+                        chat_id=job.chat_id,
+                        animation=gif_url,
+                        caption=roast,
+                        reply_to_message_id=job.message_id,
+                    )
+                    return
+                except (BadRequest, TimedOut, NetworkError, TelegramError) as exc:
+                    logger.warning(
+                        "Не удалось отправить GIPHY GIF: %s",
+                        exc,
+                    )
+
+        # Локальные медиа
+        choice = random.random()
+
+        photos = _media_files(
+            PHOTO_DIR,
+            (".jpg", ".jpeg", ".png", ".webp"),
+        )
+
+        gifs = _media_files(
+            GIF_DIR,
+            (".gif", ".mp4"),
+        )
+
+        stickers = _media_files(
+            STICKER_DIR,
+            (".webp", ".tgs"),
+        )
+
+        voices = _media_files(
+            VOICE_DIR,
+            (".ogg",),
+        )
+
+        try:
+            # 15% фото
+            if photos and choice < 0.15:
+                photo = random.choice(photos)
+
+                with photo.open("rb") as file:
+                    await bot.send_photo(
+                        chat_id=job.chat_id,
+                        photo=file,
+                        caption=roast,
+                        reply_to_message_id=job.message_id,
+                    )
+
+                return
+
+            # 15% локальный GIF
+            if gifs and choice < 0.30:
+                gif = random.choice(gifs)
+
+                with gif.open("rb") as file:
+                    await bot.send_animation(
+                        chat_id=job.chat_id,
+                        animation=file,
+                        caption=roast,
+                        reply_to_message_id=job.message_id,
+                    )
+
+                return
+
+            # 10% стикер
+            if stickers and choice < 0.40:
+                sticker = random.choice(stickers)
+
+                with sticker.open("rb") as file:
+                    await bot.send_sticker(
+                        chat_id=job.chat_id,
+                        sticker=file,
+                    )
+
+                await bot.send_message(
+                    chat_id=job.chat_id,
+                    text=roast,
+                    reply_to_message_id=job.message_id,
+                )
+
+                return
+
+            # 10% голосовое
+            if voices and choice < 0.50:
+                voice = random.choice(voices)
+
+                with voice.open("rb") as file:
+                    await bot.send_voice(
+                        chat_id=job.chat_id,
+                        voice=file,
+                        caption=roast,
+                        reply_to_message_id=job.message_id,
+                    )
+
+                return
+
+            # Обычный текст
+            await bot.send_message(
+                chat_id=job.chat_id,
+                text=roast,
+                reply_to_message_id=job.message_id,
+            )
+
+        except RetryAfter as exc:
+            logger.warning(
+                "Telegram попросил подождать %.2f секунд",
+                exc.retry_after,
+            )
+
+            await asyncio.sleep(exc.retry_after)
+
+            try:
+                await bot.send_message(
+                    chat_id=job.chat_id,
+                    text=roast,
+                    reply_to_message_id=job.message_id,
+                )
+            except TelegramError:
+                logger.exception("Не удалось отправить повторно")
+
+        except (BadRequest, TimedOut, NetworkError) as exc:
+            logger.warning(
+                "Ошибка отправки ответа: %s",
+                exc,
+            )
+
+        except TelegramError:
+            logger.exception("Ошибка Telegram API")
+
+
+def get_service(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> RoastService:
+    return context.application.bot_data["roast_service"]
+
+
+async def owner_only(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    service = get_service(context)
+
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return False
+
+    if not service.is_owner(user.id):
+        await message.reply_text(
+            "Не тебе этой кнопкой пользоваться 😎"
+        )
+        return False
+
+    return True
+
+
+async def cmd_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+
+    if message is None:
+        return
+
+    await message.reply_text(
+        "Я Roast Bot 😈\n"
+        "В группе могу подкалывать сообщения.\n\n"
+        "/help — команды"
+    )
+
+
+async def cmd_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+
+    if message is None:
+        return
+
+    await message.reply_text(
+        "/on — включить roast\n"
+        "/off — выключить roast\n"
+        "/status — статус\n"
+        "/myid — показать твой Telegram ID"
+    )
+
+
+async def cmd_on(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await owner_only(update, context):
+        return
+
+    message = update.effective_message
+
+    if message is None:
+        return
+
+    if message.chat.type not in GROUP_TYPES:
+        await message.reply_text(
+            "Эту команду используй в группе."
+        )
+        return
+
+    service = get_service(context)
+
+    service.state.set_enabled(message.chat_id, True)
+
+    await message.reply_text(
+        "🔥 Roast режим включён."
+    )
+
+
+async def cmd_off(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await owner_only(update, context):
+        return
+
+    message = update.effective_message
+
+    if message is None:
+        return
+
+    if message.chat.type not in GROUP_TYPES:
+        await message.reply_text(
+            "Эту команду используй в группе."
+        )
+        return
+
+    service = get_service(context)
+
+    service.state.set_enabled(message.chat_id, False)
+
+    await message.reply_text(
+        "🛑 Roast режим выключен."
+    )
+
+
+async def cmd_status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await owner_only(update, context):
+        return
+
+    message = update.effective_message
+
+    if message is None:
+        return
+
+    if message.chat.type not in GROUP_TYPES:
+        await message.reply_text(
+            "Эту команду используй в группе."
+        )
+        return
+
+    service = get_service(context)
+
+    enabled = service.state.is_enabled(message.chat_id)
+
+    giphy_status = "включён" if service.giphy.enabled else "не настроен"
+
+    await message.reply_text(
+        f"Roast: {'ВКЛЮЧЁН 🔥' if enabled else 'ВЫКЛЮЧЕН 🛑'}\n"
+        f"GIPHY: {giphy_status}"
+    )
+
+
+async def cmd_myid(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+
+    await message.reply_text(
+        f"Твой Telegram ID: {user.id}"
+    )
+
+
+async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or update.effective_chat.type not in GROUP_TYPES:
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    service = get_service(context)
+    if not service:
+        return
+
+    if message.photo:
+        service.media_memory.add("photos", message.photo[-1].file_id)
+
+    elif message.animation:
+        service.media_memory.add("gifs", message.animation.file_id)
+
+    elif message.sticker:
+        service.media_memory.add("stickers", message.sticker.file_id)
+
+    elif message.voice:
+        service.media_memory.add("voices", message.voice.file_id)
+
+
+async def on_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    if message.chat.type not in GROUP_TYPES:
+        return
+
+    text = message.text or message.caption or ""
+
+    if not text.strip():
+        return
+
+    service = get_service(context)
+
+    service.enqueue(
+        chat_id=message.chat_id,
+        message_id=message.message_id,
+        author=user.full_name or user.username or "Пользователь",
+        text=text,
+        user_id=user.id,
+    )
+
+
+async def on_my_chat_member(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    logger.info("Изменился статус бота в чате")
+
+
+async def _health_handler(reader, writer) -> None:
+    try:
+        await asyncio.wait_for(reader.read(1024), timeout=5)
+    except Exception:
+        pass
+
+    try:
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n\r\n"
+            b"ok"
+        )
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+
+async def start_health_server():
+    """На Render слушаем порт PORT, чтобы бесплатный Web Service считался живым."""
+    port = os.getenv("PORT", "").strip()
+
+    if not port:
+        return None
+
+    server = await asyncio.start_server(_health_handler, "0.0.0.0", int(port))
+    logger.info("Health-сервер запущен на порту %s", port)
+    return server
+
+
+async def post_init(
+    application: Application,
+) -> None:
+    settings = application.bot_data["settings"]
+
+    application.bot_data["health_server"] = await start_health_server()
+
+    ai = AIClient(settings)
+    state = ChatStateStore(settings.state_file)
+    giphy = GiphyClient()
+
+    service = RoastService(
+        application=application,
+        settings=settings,
+        ai=ai,
+        state=state,
+        giphy=giphy,
+    )
+
+    application.bot_data["ai"] = ai
+    application.bot_data["state"] = state
+    application.bot_data["giphy"] = giphy
+    application.bot_data["roast_service"] = service
+
+    logger.info(
+        "Бот запущен. Gemini model: %s",
+        settings.ai_model,
+    )
+
+    if giphy.enabled:
+        logger.info("GIPHY подключён.")
+    else:
+        logger.info("GIPHY не настроен.")
+
+
+async def post_shutdown(
+    application: Application,
+) -> None:
+    health_server = application.bot_data.get("health_server")
+
+    if health_server is not None:
+        health_server.close()
+
+    ai = application.bot_data.get("ai")
+    giphy = application.bot_data.get("giphy")
+
+    if ai is not None:
+        await ai.close()
+
+    if giphy is not None:
+        await giphy.close()
+
+
+def main() -> None:
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        raise SystemExit(f"Ошибка настроек: {exc}")
+
+    logging.basicConfig(
+        level=getattr(
+            logging,
+            settings.log_level.upper(),
+            logging.INFO,
+        ),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    # httpx пишет в лог адреса запросов вместе с токеном и ключом
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    application = (
+        Application.builder()
+        .token(settings.telegram_token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.bot_data["settings"] = settings
+
+    # Команды
+    application.add_handler(
+        CommandHandler("start", cmd_start)
+    )
+
+    application.add_handler(
+        CommandHandler("help", cmd_help)
+    )
+
+    application.add_handler(
+        CommandHandler("on", cmd_on)
+    )
+
+    application.add_handler(
+        CommandHandler("off", cmd_off)
+    )
+
+    application.add_handler(
+        CommandHandler("status", cmd_status)
+    )
+
+    application.add_handler(
+        CommandHandler("myid", cmd_myid)
+    )
+
+    # Обычные сообщения группы
+    application.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.CAPTION)
+            & ~filters.COMMAND
+            & filters.ChatType.GROUPS
+            & filters.UpdateType.MESSAGE,
+            on_text,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            (
+                filters.PHOTO
+                | filters.ANIMATION
+                | filters.Sticker.ALL
+                | filters.VOICE
+            )
+            & filters.ChatType.GROUPS
+            & filters.UpdateType.MESSAGE,
+            on_media,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.LEFT_CHAT_MEMBER,
+            on_my_chat_member,
+        )
+    )
+
+    logger.info("Запускаю polling...")
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+if __name__ == "__main__":
+    main()
