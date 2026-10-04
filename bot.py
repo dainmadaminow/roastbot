@@ -305,7 +305,7 @@ class RoastService:
         roast = (roast or "").strip()
 
         if not roast:
-            roast = "У меня даже слов на это нет 💀"
+            roast = "ТЕСТ_АИ_ПУСТО"
 
         roast = roast[: self.settings.max_reply_chars]
 
