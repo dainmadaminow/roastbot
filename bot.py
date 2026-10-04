@@ -22,6 +22,7 @@ from ai import AIClient
 from config import ConfigError, Settings, load_settings
 from state import ChatStateStore
 from media_memory import MediaMemory
+from voice import VoiceTranscriber
 
 async def self_ping():
     import asyncio, os, httpx
@@ -179,12 +180,14 @@ class RoastService:
         ai: AIClient,
         state: ChatStateStore,
         giphy: GiphyClient,
+        voice: VoiceTranscriber,
     ) -> None:
         self.application = application
         self.settings = settings
         self.ai = ai
         self.state = state
         self.giphy = giphy
+        self.voice = voice
         self.media_memory = MediaMemory()
 
         self.queues: dict[int, deque[Job]] = defaultdict(deque)
@@ -414,6 +417,36 @@ class RoastService:
                 logger.exception("Не удалось отправить ответ владельцу")
             return
 
+        # Сохранённый стикер: отдельный шанс примерно 15%.
+        # В 70% случаев после стикера также отправляется roast-текст,
+        # в остальных случаях стикер идёт без текста.
+        if self.media_memory.count("stickers") and random.random() < 0.15:
+            sticker_id = self.media_memory.random("stickers")
+
+            if sticker_id:
+                try:
+                    await bot.send_sticker(
+                        chat_id=job.chat_id,
+                        sticker=sticker_id,
+                        reply_to_message_id=job.message_id,
+                    )
+
+                    if random.random() < 0.70:
+                        await bot.send_message(
+                            chat_id=job.chat_id,
+                            text=roast,
+                            reply_to_message_id=job.message_id,
+                        )
+
+                    logger.info("Отправлен сохранённый стикер.")
+                    return
+
+                except (BadRequest, TimedOut, NetworkError, TelegramError) as exc:
+                    logger.warning(
+                        "Не удалось отправить сохранённый стикер: %s",
+                        exc,
+                    )
+
         if random.random() < 0.25:
             if await self._send_saved_media(job, roast):
                 return
@@ -490,23 +523,6 @@ class RoastService:
                         caption=roast,
                         reply_to_message_id=job.message_id,
                     )
-
-                return
-
-            if stickers and choice < 0.40:
-                sticker = random.choice(stickers)
-
-                with sticker.open("rb") as file:
-                    await bot.send_sticker(
-                        chat_id=job.chat_id,
-                        sticker=file,
-                    )
-
-                await bot.send_message(
-                    chat_id=job.chat_id,
-                    text=roast,
-                    reply_to_message_id=job.message_id,
-                )
 
                 return
 
@@ -720,24 +736,92 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     message = update.effective_message
-    if not message:
+    user = update.effective_user
+
+    if message is None or user is None:
         return
 
     service = get_service(context)
-    if not service:
-        return
 
     if message.photo:
         service.media_memory.add("photos", message.photo[-1].file_id)
+        return
 
-    elif message.animation:
+    if message.animation:
         service.media_memory.add("gifs", message.animation.file_id)
+        return
 
-    elif message.sticker:
+    if message.sticker:
         service.media_memory.add("stickers", message.sticker.file_id)
+        return
 
-    elif message.voice:
-        service.media_memory.add("voices", message.voice.file_id)
+    if not message.voice:
+        return
+
+    # Сохраняем file_id голосового для будущей отправки сохранённых voice.
+    service.media_memory.add("voices", message.voice.file_id)
+
+    # Если roast выключен, не тратим запрос Gemini на распознавание.
+    if not service.state.is_enabled(message.chat_id):
+        return
+
+    temp_dir = BASE_DIR / "temp_voice"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    voice_path = temp_dir / f"{message.chat_id}_{message.message_id}.ogg"
+
+    try:
+        try:
+            await context.bot.send_chat_action(
+                chat_id=message.chat_id,
+                action=ChatAction.TYPING,
+            )
+        except TelegramError:
+            pass
+
+        telegram_file = await context.bot.get_file(message.voice.file_id)
+        await telegram_file.download_to_drive(custom_path=voice_path)
+
+        transcript = await service.voice.transcribe(voice_path)
+
+        if not transcript.strip():
+            logger.warning(
+                "Gemini не распознал голосовое %s в чате %s",
+                message.message_id,
+                message.chat_id,
+            )
+            return
+
+        service.enqueue(
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+            author=user.full_name or user.username or "Пользователь",
+            text=transcript,
+            user_id=user.id,
+        )
+
+    except TelegramError:
+        logger.exception(
+            "Telegram API: ошибка обработки голосового %s",
+            message.message_id,
+        )
+
+    except OSError:
+        logger.exception(
+            "Ошибка файла голосового %s",
+            message.message_id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Неожиданная ошибка обработки голосового %s",
+            message.message_id,
+        )
+
+    finally:
+        try:
+            voice_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def on_text(
@@ -818,6 +902,7 @@ async def post_init(
     ai = AIClient(settings)
     state = ChatStateStore(settings.state_file)
     giphy = GiphyClient()
+    voice = VoiceTranscriber(settings.ai_api_key)
 
     service = RoastService(
         application=application,
@@ -825,11 +910,13 @@ async def post_init(
         ai=ai,
         state=state,
         giphy=giphy,
+        voice=voice,
     )
 
     application.bot_data["ai"] = ai
     application.bot_data["state"] = state
     application.bot_data["giphy"] = giphy
+    application.bot_data["voice"] = voice
     application.bot_data["roast_service"] = service
 
     logger.info(
@@ -853,12 +940,16 @@ async def post_shutdown(
 
     ai = application.bot_data.get("ai")
     giphy = application.bot_data.get("giphy")
+    voice = application.bot_data.get("voice")
 
     if ai is not None:
         await ai.close()
 
     if giphy is not None:
         await giphy.close()
+
+    if voice is not None:
+        await voice.close()
 
 
 def main() -> None:
