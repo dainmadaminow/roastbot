@@ -170,6 +170,8 @@ class AIClient:
             response.raise_for_status()
 
         data = response.json()
+        logger.warning("GROQ RESPONSE: %s", data)
+        
         choices = data.get("choices", [])
 
         if not choices:
