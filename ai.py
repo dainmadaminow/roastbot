@@ -1,4 +1,4 @@
-"""Работа с Groq API через OpenAI-совместимый интерфейс."""
+"""Работа с Gemini AI API через OpenAI-совместимый интерфейс."""
 from __future__ import annotations
 
 import logging
@@ -136,7 +136,7 @@ class AIClient:
         system_prompt: str,
         user_prompt: str,
     ) -> str:
-        """Отправляет запрос в Groq API."""
+        """Отправляет запрос в AI API."""
         base_url = self._settings.ai_base_url.rstrip("/")
         url = f"{base_url}/chat/completions"
 
@@ -163,19 +163,19 @@ class AIClient:
 
         if response.status_code != 200:
             logger.error(
-                "Groq API HTTP %s: %s",
+                "AI API HTTP %s: %s",
                 response.status_code,
                 response.text[:1000],
             )
             response.raise_for_status()
 
         data = response.json()
-        logger.warning("GROQ RESPONSE: %s", data)
+        logger.debug("AI RESPONSE: %s", data)
         
         choices = data.get("choices", [])
 
         if not choices:
-            logger.warning("Groq не вернул choices: %s", data)
+            logger.warning("AI не вернул choices: %s", data)
             return ""
 
         return choices[0].get("message", {}).get("content", "")
